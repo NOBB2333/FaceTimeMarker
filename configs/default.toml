@@ -1,0 +1,12 @@
+# FaceTimeMarker 默认配置入口
+#
+# 这个文件只负责把配置拆分组合起来。默认启动、CLI、API 仍然读取这里。
+# 如果你只想改识别准确率，优先看 recognition.toml。
+# 如果你只想填大模型 API Key，看 ai.toml。
+
+"包含配置" = [
+  "recognition.toml",
+  "outputs.toml",
+  "reference_export.toml",
+  "ai.toml",
+]

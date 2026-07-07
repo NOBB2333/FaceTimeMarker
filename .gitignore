@@ -1,0 +1,41 @@
+# macOS / editor noise
+.DS_Store
+**/.DS_Store
+
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local development tooling
+.codegraph/
+.agents/skills/
+skills/
+
+# Frontend dependencies and build outputs
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+
+# Application runtime data
+data/*
+!data/.gitkeep
+outputs/*
+_outputs/*
+!_outputs/.gitkeep
+
+# Local videos and generated media
+*.avi
+*.m4v
+*.mkv
+*.mov
+*.mp4
+*.webm
+_test_video/
+
+# Third-party reference source is managed through git submodules.
+third_party/*/
+!third_party/ByteTrack/
+!third_party/insightface/

@@ -1,0 +1,6 @@
+[submodule "third_party/ByteTrack"]
+	path = third_party/ByteTrack
+	url = https://github.com/FoundationVision/ByteTrack.git
+[submodule "third_party/insightface"]
+	path = third_party/insightface
+	url = https://github.com/deepinsight/insightface.git

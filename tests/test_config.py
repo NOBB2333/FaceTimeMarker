@@ -44,8 +44,10 @@ def test_config_can_dump_chinese_aliases() -> None:
     assert payload["逐帧框"]["播放红框使用逐帧框"] is True
     assert payload["参考图导出"]["抽帧策略"] == "best"
     assert isinstance(payload["大模型"]["API Key"], str)
+    assert payload["大模型"]["LiteLLM详细调试"] is False
     assert payload["图像生成"]["输出格式"] == "webp"
     assert payload["图像生成"]["输出压缩"] == 85
+    assert payload["图像生成"]["请求日志"] is True
 
 
 def test_analysis_cache_payload_excludes_external_ai_settings() -> None:

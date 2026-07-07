@@ -126,6 +126,7 @@ class LargeModelConfig(ChineseAliasModel):
     max_retries: int = Field(default=2, alias="最大重试次数", ge=0)
     max_output_tokens: int = Field(default=4096, alias="最大输出Token", ge=1)
     temperature: float | None = Field(default=None, alias="温度", ge=0, le=2)
+    litellm_debug: bool = Field(default=False, alias="LiteLLM详细调试")
 
 
 class ImageGenerationConfig(ChineseAliasModel):
@@ -142,6 +143,7 @@ class ImageGenerationConfig(ChineseAliasModel):
     moderation: str = Field(default="auto", alias="审核强度")
     output_compression: int | None = Field(default=85, alias="输出压缩", ge=0, le=100)
     partial_images: int = Field(default=0, alias="流式预览张数", ge=0, le=3)
+    request_logging: bool = Field(default=True, alias="请求日志")
     prompt_template: str = Field(default="", alias="提示词模板")
 
 

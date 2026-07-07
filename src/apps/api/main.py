@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import queue
+import re
 import shutil
 import tempfile
 import threading
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -35,6 +38,8 @@ from core.timeline.context import (
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 IMAGE_EXTENSIONS = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 UPLOAD_ROOT = Path("data/uploads")
+LOGGER = logging.getLogger("facetimemarker.api")
+_LITELLM_DEBUG_CONFIGURED = False
 DEFAULT_FOUR_VIEW_PROMPT = (
     "请根据我提供的参考帧，生成一张动漫角色设定图 / 角色多视图原图。"
     "输出必须是一张干净的横向单图，不要拆成多张文件。画面参考动画角色设定表："
@@ -57,6 +62,16 @@ def _result_store(config=None) -> ResultStore:
     """按配置创建结果库入口。"""
     current_config = config or load_config()
     return ResultStore(current_config.database.path, url=current_config.database.url)
+
+
+def _configure_api_logging(config) -> None:
+    """按配置启用 API 侧日志，避免四视图生成失败时只看到 400。"""
+    if config.large_model.litellm_debug:
+        LOGGER.setLevel(logging.DEBUG)
+    elif config.image_generation.request_logging:
+        LOGGER.setLevel(logging.INFO)
+    else:
+        LOGGER.setLevel(logging.WARNING)
 
 
 class AnalyzeRequest(BaseModel):
@@ -280,6 +295,7 @@ _ANALYSIS_WORKER_LOCK = threading.Lock()
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用。"""
     config = load_config()
+    _configure_api_logging(config)
     store = _result_store(config)
     app = FastAPI(title="FaceTimeMarker API")
     app.add_middleware(
@@ -1041,6 +1057,75 @@ def _profile_asset_dir(config, category: str) -> Path:
     return config.output.root / "profile-assets" / safe_category / datetime.now(UTC).strftime("%Y%m%d")
 
 
+def _sanitize_ai_log_text(config, value: object, max_length: int = 1200) -> str:
+    """清理大模型日志文本，避免 API Key 进入终端或测试输出。"""
+    text = str(value)
+    api_key = config.large_model.api_key.strip()
+    if api_key:
+        text = text.replace(api_key, "<redacted-api-key>")
+    text = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "<redacted-api-key>", text)
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._-]{12,}", "Bearer <redacted-token>", text)
+    if len(text) > max_length:
+        return f"{text[:max_length]}..."
+    return text
+
+
+def _litellm_exception_summary(config, exc: Exception) -> str:
+    """提取 LiteLLM 异常中的关键信息，返回可打印、已脱敏的短文本。"""
+    parts = [exc.__class__.__name__]
+    message = _sanitize_ai_log_text(config, exc)
+    if message and message != parts[0]:
+        parts.append(message)
+    for attr_name in ("status_code", "llm_provider", "model"):
+        attr_value = getattr(exc, attr_name, None)
+        if attr_value not in (None, ""):
+            parts.append(f"{attr_name}={_sanitize_ai_log_text(config, attr_value, 240)}")
+    return " | ".join(parts)
+
+
+def _sanitized_exception_traceback(config, exc: Exception) -> str:
+    """格式化并脱敏异常堆栈，保留排查信息但不暴露 Key。"""
+    raw_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return _sanitize_ai_log_text(config, raw_traceback, 8000)
+
+
+def _configure_litellm_debug(config) -> None:
+    """按配置打开 LiteLLM 内置 debug；默认关闭，避免日常日志过于嘈杂。"""
+    global _LITELLM_DEBUG_CONFIGURED
+    if not config.large_model.litellm_debug:
+        return
+    if _LITELLM_DEBUG_CONFIGURED:
+        return
+    litellm.set_verbose = True
+    turn_on_debug = getattr(litellm, "_turn_on_debug", None)
+    if callable(turn_on_debug):
+        turn_on_debug()
+    _LITELLM_DEBUG_CONFIGURED = True
+    LOGGER.warning("[LiteLLM] 详细调试已开启，日志可能包含完整请求/响应摘要，仅建议本地排查时使用")
+
+
+def _image_edit_request_log_payload(config, model: str, references: list[tuple[str, bytes]], kwargs: dict) -> dict:
+    """构造 image_edit 请求日志摘要，剔除图片句柄、提示词和 API Key。"""
+    forwarded_keys = sorted(key for key in kwargs if key not in {"image", "prompt", "api_key"})
+    return {
+        "model": model,
+        "provider": config.large_model.provider.strip() or "openai",
+        "api_base": _sanitize_ai_log_text(config, config.large_model.base_url, 320),
+        "api_key": "configured" if config.large_model.api_key.strip() else "empty",
+        "reference_count": len(references),
+        "reference_bytes": [len(content) for _, content in references],
+        "prompt_chars": len(kwargs.get("prompt", "")),
+        "forwarded_keys": forwarded_keys,
+        "output_format": kwargs.get("output_format"),
+        "output_compression": kwargs.get("output_compression"),
+        "size": kwargs.get("size"),
+        "quality": kwargs.get("quality"),
+        "background": kwargs.get("background"),
+        "moderation": kwargs.get("moderation"),
+        "input_fidelity": kwargs.get("input_fidelity"),
+    }
+
+
 def _generate_four_view_image(
     config,
     store: ResultStore,
@@ -1057,8 +1142,19 @@ def _generate_four_view_image(
 
     references = _resolve_four_view_reference_images(store, request.references)
     prompt = _clean_optional_text(request.prompt) or config.image_generation.prompt_template.strip() or DEFAULT_FOUR_VIEW_PROMPT
-    image_bytes = _call_litellm_image_edit(config, prompt, references)
-    return _save_generated_four_view_image(
+    request_id = uuid4().hex[:8]
+    if config.image_generation.request_logging:
+        LOGGER.info(
+            "[四视图生成:%s] 开始 global_person_id=%s label=%s references=%s prompt_chars=%s output_format=%s",
+            request_id,
+            global_person_id,
+            _sanitize_ai_log_text(config, request.label or ""),
+            len(references),
+            len(prompt),
+            config.image_generation.output_format,
+        )
+    image_bytes = _call_litellm_image_edit(config, prompt, references, request_id)
+    saved_path = _save_generated_four_view_image(
         config,
         global_person_id,
         image_bytes,
@@ -1066,6 +1162,15 @@ def _generate_four_view_image(
         config.image_generation.output_compression,
         _four_view_asset_base_name(store, global_person_id, request),
     )
+    if config.image_generation.request_logging:
+        LOGGER.info(
+            "[四视图生成:%s] 完成 global_person_id=%s saved_path=%s bytes=%s",
+            request_id,
+            global_person_id,
+            saved_path,
+            saved_path.stat().st_size if saved_path.exists() else 0,
+        )
+    return saved_path
 
 
 def _resolve_four_view_reference_images(
@@ -1101,8 +1206,10 @@ def _call_litellm_image_edit(
     config,
     prompt: str,
     references: list[tuple[str, bytes]],
+    request_id: str | None = None,
 ) -> bytes:
     """通过 LiteLLM image_edit 调用图像生成服务并返回图片字节。"""
+    _configure_litellm_debug(config)
     model = (
         config.image_generation.model.strip()
         or config.large_model.model.strip()
@@ -1145,9 +1252,21 @@ def _call_litellm_image_edit(
         if config.image_generation.input_fidelity and config.image_generation.input_fidelity != "auto":
             kwargs["input_fidelity"] = config.image_generation.input_fidelity
 
+        request_log_payload = _image_edit_request_log_payload(config, model, references, kwargs)
+        if config.image_generation.request_logging:
+            LOGGER.info("[四视图生成:%s] 调用 LiteLLM image_edit request=%s", request_id or "-", request_log_payload)
         response = litellm.image_edit(**kwargs)
     except Exception as exc:
-        raise ValueError("image generation failed") from exc
+        summary = _litellm_exception_summary(config, exc)
+        request_log_payload = locals().get("request_log_payload")
+        LOGGER.error(
+            "[四视图生成:%s] LiteLLM image_edit 失败: %s request=%s\n%s",
+            request_id or "-",
+            summary,
+            request_log_payload,
+            _sanitized_exception_traceback(config, exc),
+        )
+        raise ValueError(f"图像生成失败：{summary}") from exc
     finally:
         for handle in handles:
             handle.close()
@@ -1162,6 +1281,12 @@ def _call_litellm_image_edit(
     else:
         encoded_image = getattr(item, "b64_json", None)
     if not encoded_image:
+        LOGGER.error(
+            "[四视图生成:%s] LiteLLM 响应缺少 b64_json data_count=%s item_type=%s",
+            request_id or "-",
+            len(data) if data else 0,
+            type(item).__name__ if item is not None else None,
+        )
         raise ValueError("image generation response did not include b64_json")
     return base64.b64decode(encoded_image)
 

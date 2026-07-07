@@ -282,6 +282,50 @@ def test_api_generates_four_view_asset_as_webp_with_compression(tmp_path: Path, 
     assert saved[8:12] == b"WEBP"
 
 
+def test_api_four_view_generation_logs_sanitized_litellm_error(tmp_path: Path, monkeypatch, caplog) -> None:
+    """验证图像生成失败时会记录可排查日志，但不会泄露 API Key。"""
+    config = AppConfig(
+        output=OutputConfig(root=tmp_path / "_outputs"),
+        database=DatabaseConfig(path=tmp_path / "_outputs" / "facetimemarker.db"),
+    )
+    api_key = "sk-test-secret-1234567890"
+    config.large_model.enabled = True
+    config.large_model.api_key = api_key
+    config.large_model.base_url = "https://api.openai.test/v1"
+    config.large_model.model = "gpt-image-2"
+    config.image_generation.enabled = True
+    upload_root = tmp_path / "uploads"
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"reference-image")
+
+    def fake_image_edit(**_kwargs):  # noqa: ANN003
+        raise RuntimeError(f"upstream rejected request with token {api_key}")
+
+    monkeypatch.setattr(api_main, "load_config", lambda: config)
+    monkeypatch.setattr(api_main, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(api_main.litellm, "image_edit", fake_image_edit)
+    client = TestClient(create_app())
+    global_person_id = client.post("/api/global-people", json={"label": "失败角色"}).json()["global_person_id"]
+
+    with caplog.at_level("INFO", logger="facetimemarker.api"):
+        response = client.post(
+            f"/api/global-people/{global_person_id}/four-view-assets/generate",
+            json={
+                "label": "失败四视图",
+                "references": [{"face_path": str(reference_path)}],
+            },
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "图像生成失败" in detail
+    assert "upstream rejected request" in detail
+    assert api_key not in detail
+    assert api_key not in caplog.text
+    assert "<redacted-api-key>" in caplog.text
+    assert "调用 LiteLLM image_edit" in caplog.text
+
+
 def test_api_deletes_and_merges_manual_profiles(tmp_path: Path, monkeypatch) -> None:
     """验证人物档案可以合并、移入回收站、恢复和彻底删除。"""
     config = AppConfig(
